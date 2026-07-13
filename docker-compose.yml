@@ -1,0 +1,70 @@
+version: "3.9"
+
+# Local dev stack. See docs/ARCHITECTURE.md for the "why" behind the queue
+# and event-store abstractions referenced below.
+#
+#   * `redis` here backs the Queue abstraction (app/services/queue.py) in
+#     its RedisStreamQueue implementation. A future Kafka deployment would
+#     replace this service with Kafka + Zookeeper/KRaft and implement
+#     KafkaQueueAdapter against the same Queue interface — no application
+#     code outside services/queue.py would need to change.
+#   * `postgres` backs both the relational metadata tables AND, via the
+#     PostgresJSONBEventStore repository implementation, the normalized
+#     event store for local dev. A future OpenSearch/Elastic deployment
+#     would add an `opensearch` service here and an OpenSearchEventStore
+#     implementing the same EventStoreRepository interface
+#     (app/services/normalizer.py) — callers (the rule engine, the API
+#     layer) would not need to change.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aegis
+      POSTGRES_PASSWORD: aegis
+      POSTGRES_DB: aegis
+    ports:
+      - "5432:5432"
+    volumes:
+      - aegis_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aegis"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://aegis:aegis@postgres:5432/aegis
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_BACKEND: redis
+      ENV: development
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  aegis_postgres_data:

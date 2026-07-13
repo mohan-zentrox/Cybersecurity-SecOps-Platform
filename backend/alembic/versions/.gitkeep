@@ -1,0 +1,8 @@
+No migrations generated yet in this foundation repo.
+
+Run against a real PostgreSQL instance to produce the first migration:
+    alembic revision --autogenerate -m "initial schema"
+    alembic upgrade head
+
+Tests do not depend on Alembic — see backend/tests/conftest.py, which
+creates the schema directly against an in-memory SQLite engine.
