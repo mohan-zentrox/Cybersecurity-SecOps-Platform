@@ -116,10 +116,16 @@ def normalize_raw_event(raw: dict[str, Any]) -> dict[str, Any]:
 @dataclass
 class EventQuery:
     event_action: str | None = None
+    event_category: str | None = None
     source_ip: str | None = None
+    destination_ip: str | None = None
+    user_name: str | None = None
+    host_name: str | None = None
+    threat_matched: bool | None = None
     since: datetime | None = None
     until: datetime | None = None
     limit: int = 10_000
+    offset: int = 0
 
 
 @dataclass
@@ -138,6 +144,9 @@ class EventStoreRepository(ABC):
 
     @abstractmethod
     def query_events(self, query: EventQuery) -> list[StoredEvent]: ...
+
+    @abstractmethod
+    def count_events(self, query: EventQuery) -> int: ...
 
 
 class PostgresJSONBEventStore(EventStoreRepository):
@@ -168,18 +177,40 @@ class PostgresJSONBEventStore(EventStoreRepository):
         self.db.refresh(row)
         return StoredEvent(id=row.id, ecs=row.ecs, timestamp=row.event_timestamp, raw=row.raw)
 
-    def query_events(self, query: EventQuery) -> list[StoredEvent]:
+    def _filtered(self, query: EventQuery):
         q = self.db.query(NormalizedEvent)
         if query.event_action:
             q = q.filter(NormalizedEvent.event_action == query.event_action)
+        if query.event_category:
+            q = q.filter(NormalizedEvent.event_category == query.event_category)
         if query.source_ip:
             q = q.filter(NormalizedEvent.source_ip == query.source_ip)
+        if query.destination_ip:
+            q = q.filter(NormalizedEvent.destination_ip == query.destination_ip)
+        if query.user_name:
+            q = q.filter(NormalizedEvent.user_name == query.user_name)
+        if query.host_name:
+            q = q.filter(NormalizedEvent.host_name == query.host_name)
+        if query.threat_matched is not None:
+            q = q.filter(NormalizedEvent.threat_matched.is_(query.threat_matched))
         if query.since:
             q = q.filter(NormalizedEvent.event_timestamp >= query.since)
         if query.until:
             q = q.filter(NormalizedEvent.event_timestamp <= query.until)
-        rows = q.order_by(NormalizedEvent.event_timestamp.asc()).limit(query.limit).all()
+        return q
+
+    def query_events(self, query: EventQuery) -> list[StoredEvent]:
+        rows = (
+            self._filtered(query)
+            .order_by(NormalizedEvent.event_timestamp.asc())
+            .limit(query.limit)
+            .offset(query.offset)
+            .all()
+        )
         return [StoredEvent(id=r.id, ecs=r.ecs, timestamp=r.event_timestamp, raw=r.raw) for r in rows]
+
+    def count_events(self, query: EventQuery) -> int:
+        return self._filtered(query).count()
 
 
 def write_dead_letter(db: Session, raw_payload: dict[str, Any], error_message: str) -> DeadLetterEvent:
@@ -194,6 +225,7 @@ def write_dead_letter(db: Session, raw_payload: dict[str, Any], error_message: s
 class IngestSummary:
     accepted: int = 0
     dead_lettered: int = 0
+    threat_matches: int = 0
     stored_event_ids: list[int] = field(default_factory=list)
 
 
@@ -206,6 +238,8 @@ def process_raw_batch(db: Session, raw_events: list[dict[str, Any]]) -> IngestSu
     would call after popping messages off Redis Streams/Kafka — see
     services/queue.py and api/v1/events.py for where the hand-off happens.
     """
+    from app.services.enrichment import enrich_events  # local import: avoids a cycle
+
     store = PostgresJSONBEventStore(db)
     summary = IngestSummary()
     for raw in raw_events:
@@ -218,4 +252,13 @@ def process_raw_batch(db: Session, raw_events: list[dict[str, Any]]) -> IngestSu
         stored = store.write_event(normalized["ecs"], raw, normalized["timestamp"])
         summary.accepted += 1
         summary.stored_event_ids.append(stored.id)
+
+    # Threat-intel enrichment runs after persistence so matched indicators are
+    # written onto the stored ECS document and are therefore visible to the
+    # detection rules that run next (FRD-TI-03).
+    if summary.stored_event_ids:
+        rows = db.query(NormalizedEvent).filter(NormalizedEvent.id.in_(summary.stored_event_ids)).all()
+        enrichment = enrich_events(db, rows)
+        summary.threat_matches = enrichment.events_matched
+
     return summary

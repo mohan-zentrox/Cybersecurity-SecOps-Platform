@@ -11,7 +11,7 @@ time from the severity-to-minutes mapping in core/config.py.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, PortableJSON
@@ -24,12 +24,24 @@ class CaseStatus:
     ESCALATED = "escalated"
 
 
+class CaseResolution:
+    TRUE_POSITIVE = "true_positive"
+    FALSE_POSITIVE = "false_positive"
+    BENIGN_TRUE_POSITIVE = "benign_true_positive"
+    DUPLICATE = "duplicate"
+    INCONCLUSIVE = "inconclusive"
+
+    ALL = (TRUE_POSITIVE, FALSE_POSITIVE, BENIGN_TRUE_POSITIVE, DUPLICATE, INCONCLUSIVE)
+
+
 class TimelineEventType:
     STATUS_CHANGE = "status_change"
     COMMENT = "comment"
     ASSIGNMENT = "assignment"
     ALERT_LINKED = "alert_linked"
     CREATED = "created"
+    SLA_BREACH = "sla_breach"
+    VULNERABILITY_LINKED = "vulnerability_linked"
 
 
 class Case(Base):
@@ -41,7 +53,14 @@ class Case(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default=CaseStatus.NEW)
     assigned_to: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
 
-    sla_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sla_due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    sla_breached: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Populated when a case is closed; required by the API so every closure
+    # records a disposition rather than silently vanishing (FRD-CASE-06).
+    resolution: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resolution_summary: Mapped[str | None] = mapped_column(String(4000), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

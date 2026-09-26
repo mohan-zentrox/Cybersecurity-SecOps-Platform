@@ -50,6 +50,14 @@ class DetectionRule(Base):
     logic: Mapped[dict] = mapped_column(PortableJSON, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
 
+    # Incremental-evaluation watermark: the newest event timestamp this rule
+    # has already been evaluated against. services/rule_engine.py only reads
+    # events newer than (watermark - RULE_EVAL_LOOKBACK_SECONDS) so a full
+    # table scan is not required on every ingest batch.
+    eval_watermark: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    alert_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
     created_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

@@ -67,31 +67,96 @@ class InMemoryQueue(Queue):
 
 
 class RedisStreamQueue(Queue):
-    """Redis Streams-backed queue. Requires the `redis` package and a reachable REDIS_URL."""
+    """Redis Streams-backed queue using **consumer groups**.
 
-    def __init__(self, redis_url: str) -> None:
+    Delivery semantics matter here. A naive XRANGE + XDEL implementation
+    deletes a message before the normalizer has durably written it, so a
+    crash mid-batch silently loses events — at-most-once, not at-least-once.
+    This implementation instead:
+
+      1. reads with ``XREADGROUP``, which moves entries into the consumer's
+         Pending Entries List (PEL) rather than removing them;
+      2. hands the messages to the caller;
+      3. acknowledges with ``XACK`` only once the caller confirms the batch
+         was processed (``ack_batch``), or via ``dequeue_batch``'s
+         auto-acknowledge for the inline/dev path.
+
+    Anything left unacknowledged when a worker dies stays in the PEL and is
+    reclaimed by the next worker through ``XAUTOCLAIM`` (``reclaim_stale``).
+    """
+
+    def __init__(self, redis_url: str, *, group: str | None = None, consumer: str | None = None) -> None:
         import redis  # local import: keep the `redis` package optional for memory-only setups
 
+        settings = get_settings()
         self._client = redis.Redis.from_url(redis_url)
+        self._group = group or settings.QUEUE_CONSUMER_GROUP
+        self._consumer = consumer or settings.QUEUE_CONSUMER_NAME
+        self._groups_ready: set[str] = set()
+
+    def _ensure_group(self, topic: str) -> None:
+        if topic in self._groups_ready:
+            return
+        import redis
+
+        try:
+            # mkstream so the group can be created before the first XADD.
+            self._client.xgroup_create(topic, self._group, id="0", mkstream=True)
+        except redis.ResponseError as exc:
+            if "BUSYGROUP" not in str(exc):
+                raise
+        self._groups_ready.add(topic)
+
+    @staticmethod
+    def _decode(fields: dict) -> dict[str, Any]:
+        raw = fields.get(b"payload") or fields.get("payload")
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8")
+        return json.loads(raw)
 
     def enqueue(self, topic: str, message: dict[str, Any]) -> None:
+        self._ensure_group(topic)
         self._client.xadd(topic, {"payload": json.dumps(message)})
 
-    def dequeue_batch(self, topic: str, max_messages: int = 100) -> list[dict[str, Any]]:
-        entries = self._client.xrange(topic, count=max_messages)
-        if not entries:
+    def read_batch(self, topic: str, max_messages: int = 100, block_ms: int = 0) -> list[tuple[Any, dict[str, Any]]]:
+        """Read undelivered entries into this consumer's PEL. Returns (entry_id, message) pairs."""
+        self._ensure_group(topic)
+        response = self._client.xreadgroup(
+            groupname=self._group,
+            consumername=self._consumer,
+            streams={topic: ">"},
+            count=max_messages,
+            block=block_ms or None,
+        )
+        if not response:
             return []
-        ids_to_ack = []
-        messages = []
-        for entry_id, fields in entries:
-            ids_to_ack.append(entry_id)
-            raw = fields.get(b"payload") or fields.get("payload")
-            if isinstance(raw, bytes):
-                raw = raw.decode("utf-8")
-            messages.append(json.loads(raw))
-        if ids_to_ack:
-            self._client.xdel(topic, *ids_to_ack)
-        return messages
+        entries = response[0][1]
+        return [(entry_id, self._decode(fields)) for entry_id, fields in entries]
+
+    def ack_batch(self, topic: str, entry_ids: list[Any]) -> None:
+        """Acknowledge processed entries, removing them from the PEL."""
+        if entry_ids:
+            self._ensure_group(topic)
+            self._client.xack(topic, self._group, *entry_ids)
+
+    def reclaim_stale(self, topic: str, min_idle_ms: int = 60_000, count: int = 100) -> list[tuple[Any, dict[str, Any]]]:
+        """Take over entries a dead consumer left pending (at-least-once recovery)."""
+        self._ensure_group(topic)
+        _, entries, _ = self._client.xautoclaim(
+            topic, self._group, self._consumer, min_idle_time=min_idle_ms, count=count
+        )
+        return [(entry_id, self._decode(fields)) for entry_id, fields in entries if fields]
+
+    def dequeue_batch(self, topic: str, max_messages: int = 100) -> list[dict[str, Any]]:
+        """Read-and-acknowledge in one step.
+
+        Used by the inline ingest path, where the caller processes the batch
+        inside the same request and there is no separate ack point. Workers
+        should use read_batch/ack_batch instead so a crash is recoverable.
+        """
+        batch = self.read_batch(topic, max_messages)
+        self.ack_batch(topic, [entry_id for entry_id, _ in batch])
+        return [message for _, message in batch]
 
     def depth(self, topic: str) -> int:
         return self._client.xlen(topic)

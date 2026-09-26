@@ -16,7 +16,7 @@ can be inspected and replayed rather than silently dropped.
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Integer, String
+from sqlalchemy import Boolean, DateTime, Integer, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base, PortableJSON
@@ -48,6 +48,10 @@ class NormalizedEvent(Base):
     ecs: Mapped[dict] = mapped_column(PortableJSON, default=dict)
     raw: Mapped[dict] = mapped_column(PortableJSON, default=dict)
 
+    # threat.indicator.* annotations written by services/enrichment.py.
+    enrichment: Mapped[dict] = mapped_column(PortableJSON, default=dict)
+    threat_matched: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+
 
 class DeadLetterEvent(Base):
     """Raw events that failed normalization."""
@@ -60,3 +64,9 @@ class DeadLetterEvent(Base):
     received_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )
+
+    # Replay bookkeeping (FRD-ING-05): a dead letter can be re-submitted
+    # through the normalizer once the upstream producer is fixed.
+    replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replay_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    resolved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
