@@ -5,9 +5,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class RuleCondition(BaseModel):
-    field: str
-    operator: Literal["eq", "neq", "contains", "gt", "gte", "lt", "lte", "in"]
-    value: Any
+    field: str = Field(min_length=1, max_length=256)
+    operator: Literal["eq", "neq", "contains", "gt", "gte", "lt", "lte", "in", "regex", "exists"]
+    value: Any = None
 
 
 class RuleThreshold(BaseModel):
@@ -23,8 +23,8 @@ class RuleLogic(BaseModel):
 
 
 class RuleCreate(BaseModel):
-    name: str
-    description: str = ""
+    name: str = Field(min_length=1, max_length=255)
+    description: str = Field(default="", max_length=2000)
     severity: Literal["low", "medium", "high", "critical"]
     mitre_technique_id: str | None = None
     logic: RuleLogic
@@ -41,9 +41,27 @@ class RuleOut(BaseModel):
     mitre_technique_id: str | None
     logic: dict
     enabled: bool
+    eval_watermark: datetime | None
+    last_evaluated_at: datetime | None
+    alert_count: int
     created_by: int | None
     created_at: datetime
     updated_at: datetime
+
+
+class RuleUpdate(BaseModel):
+    """Partial update. Every field is optional; omitted fields are left alone."""
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=2000)
+    severity: Literal["low", "medium", "high", "critical"] | None = None
+    mitre_technique_id: str | None = Field(default=None, max_length=16)
+    logic: RuleLogic | None = None
+    enabled: bool | None = None
+
+
+class RuleToggle(BaseModel):
+    enabled: bool
 
 
 class RuleTestRequest(BaseModel):
@@ -67,3 +85,4 @@ class RuleEvaluateResponse(BaseModel):
     matches_found: int
     alerts_created: int
     alert_ids: list[int]
+    events_scanned: int = 0

@@ -1,20 +1,34 @@
 """
-FRD ref: FRD-ALERT-01/02/03 — alert listing, state-machine-enforced status
-transitions, assignment, and promotion of one or more alerts into a Case.
+FRD ref: FRD-ALERT-01/02/03/05 — alert listing with filters and paging,
+state-machine-enforced status transitions, bulk triage, assignment, and
+promotion of one or more alerts into a Case.
+
+Status transitions maintain the lifecycle timestamps the KPI layer reads
+(`acknowledged_at` on the first move off `new`, `closed_at` on reaching
+the terminal state), so MTTA/MTTR never have to be reconstructed from the
+audit log.
 """
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.core.deps import get_current_user, get_db, require_roles
-from app.models.alert import Alert
+from app.core.pagination import Page, PageParams, page_params, paginate
+from app.models.alert import Alert, AlertStatus
 from app.models.case import Case, CaseAlertLink, CaseStatus, CaseTimelineEvent, TimelineEventType
 from app.models.rule import Severity
 from app.models.user import AppRole, User
-from app.schemas.alert import AlertAssign, AlertOut, AlertStatusUpdate, PromoteToCaseRequest
+from app.schemas.alert import (
+    AlertAssign,
+    AlertBulkResult,
+    AlertBulkStatusUpdate,
+    AlertOut,
+    AlertStatusUpdate,
+    PromoteToCaseRequest,
+)
 from app.schemas.case import CaseOut
 from app.services.audit_chain import append_audit_event
 from app.services.state_machine import InvalidTransitionError, validate_transition
@@ -39,13 +53,69 @@ def _get_alert_or_404(db: Session, alert_id: int) -> Alert:
     return alert
 
 
-@router.get("", response_model=list[AlertOut])
-def list_alerts(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[Alert]:
-    return db.query(Alert).order_by(Alert.created_at.desc()).all()
+def _validate_assignee(db: Session, user_id: int | None) -> None:
+    if user_id is None:
+        return
+    assignee = db.query(User).filter(User.id == user_id, User.is_active.is_(True)).first()
+    if assignee is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Assignee is not an active user"
+        )
+
+
+def _apply_transition(alert: Alert, target: str) -> None:
+    """Move the alert and stamp the lifecycle timestamps the KPI layer reads."""
+    validate_transition(alert.status, target)
+    now = datetime.now(timezone.utc)
+    if alert.status == AlertStatus.NEW and alert.acknowledged_at is None:
+        alert.acknowledged_at = now
+    if target == AlertStatus.CLOSED:
+        alert.closed_at = now
+    alert.status = target
+
+
+@router.get("", response_model=Page[AlertOut])
+def list_alerts(
+    status_filter: str | None = Query(default=None, alias="status"),
+    severity: str | None = None,
+    assigned_to: int | None = None,
+    rule_id: int | None = None,
+    sla_breached: bool | None = None,
+    unassigned: bool | None = None,
+    search: str | None = Query(default=None, max_length=200),
+    params: PageParams = Depends(page_params),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Page[AlertOut]:
+    query = db.query(Alert)
+    if status_filter:
+        query = query.filter(Alert.status == status_filter)
+    if severity:
+        query = query.filter(Alert.severity == severity)
+    if assigned_to is not None:
+        query = query.filter(Alert.assigned_to == assigned_to)
+    if unassigned:
+        query = query.filter(Alert.assigned_to.is_(None))
+    if rule_id is not None:
+        query = query.filter(Alert.rule_id == rule_id)
+    if sla_breached is not None:
+        query = query.filter(Alert.sla_breached.is_(sla_breached))
+    if search:
+        query = query.filter(Alert.title.ilike(f"%{search}%"))
+
+    rows, total = paginate(db, query.order_by(Alert.created_at.desc()), params)
+    return Page[AlertOut](
+        items=[AlertOut.model_validate(r) for r in rows],
+        total=total,
+        limit=params.limit,
+        offset=params.offset,
+    )
 
 
 @router.get("/{alert_id}", response_model=AlertOut)
-def get_alert(alert_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> Alert:
+def get_alert(
+    alert_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> Alert:
     return _get_alert_or_404(db, alert_id)
 
 
@@ -57,13 +127,12 @@ def update_alert_status(
     db: Session = Depends(get_db),
 ) -> Alert:
     alert = _get_alert_or_404(db, alert_id)
+    previous_status = alert.status
     try:
-        validate_transition(alert.status, payload.status)
+        _apply_transition(alert, payload.status)
     except InvalidTransitionError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    previous_status = alert.status
-    alert.status = payload.status
     db.commit()
     db.refresh(alert)
 
@@ -77,6 +146,40 @@ def update_alert_status(
     return alert
 
 
+@router.post("/bulk/status", response_model=AlertBulkResult)
+def bulk_update_status(
+    payload: AlertBulkStatusUpdate,
+    current_user: User = Depends(require_roles(*_ANALYST_PLUS)),
+    db: Session = Depends(get_db),
+) -> AlertBulkResult:
+    """Triage many alerts at once; per-alert failures are reported, not fatal."""
+    updated: list[int] = []
+    failed: dict[str, str] = {}
+
+    alerts = db.query(Alert).filter(Alert.id.in_(payload.alert_ids)).all()
+    found = {a.id for a in alerts}
+    for missing in set(payload.alert_ids) - found:
+        failed[str(missing)] = "Alert not found"
+
+    for alert in alerts:
+        previous_status = alert.status
+        try:
+            _apply_transition(alert, payload.status)
+        except InvalidTransitionError as exc:
+            failed[str(alert.id)] = str(exc)
+            continue
+        updated.append(alert.id)
+        append_audit_event(
+            db,
+            actor=current_user.username,
+            action="alert_status_changed",
+            resource=f"alert:{alert.id}",
+            details={"from": previous_status, "to": payload.status, "bulk": True},
+        )
+    db.commit()
+    return AlertBulkResult(updated=updated, failed=failed)
+
+
 @router.patch("/{alert_id}/assign", response_model=AlertOut)
 def assign_alert(
     alert_id: int,
@@ -85,6 +188,7 @@ def assign_alert(
     db: Session = Depends(get_db),
 ) -> Alert:
     alert = _get_alert_or_404(db, alert_id)
+    _validate_assignee(db, payload.assigned_to)
     alert.assigned_to = payload.assigned_to
     db.commit()
     db.refresh(alert)
@@ -105,9 +209,6 @@ def promote_alerts_to_case(
     current_user: User = Depends(require_roles(*_ANALYST_PLUS)),
     db: Session = Depends(get_db),
 ) -> Case:
-    if not payload.alert_ids:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="alert_ids must not be empty")
-
     alerts = db.query(Alert).filter(Alert.id.in_(payload.alert_ids)).all()
     if len(alerts) != len(set(payload.alert_ids)):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or more alerts not found")
@@ -145,6 +246,13 @@ def promote_alerts_to_case(
                 actor=current_user.username,
             )
         )
+        # Promotion is triage: an alert that has become a case is under
+        # investigation, so advance it rather than leaving it sitting in `new`.
+        if alert.status == AlertStatus.NEW:
+            try:
+                _apply_transition(alert, AlertStatus.INVESTIGATING)
+            except InvalidTransitionError:  # pragma: no cover - `new` always permits this
+                pass
     db.commit()
     db.refresh(case)
 
