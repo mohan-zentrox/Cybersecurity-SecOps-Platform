@@ -105,13 +105,62 @@ def test_case_invalid_transition_rejected_with_400(client, analyst_user, db):
     headers = auth_headers(client, "analyst1")
     case_id = client.post("/api/v1/alerts/promote", headers=headers, json={"alert_ids": [alert.id]}).json()["id"]
 
-    # new -> closed is not a legal direct transition.
-    resp = client.patch(f"/api/v1/cases/{case_id}/status", headers=headers, json={"status": "closed"})
+    # new -> closed is not a legal direct transition. A resolution is supplied
+    # so the request passes schema validation and genuinely reaches the state
+    # machine (closing without one is rejected earlier - see the test below).
+    resp = client.patch(
+        f"/api/v1/cases/{case_id}/status",
+        headers=headers,
+        json={"status": "closed", "resolution": "false_positive"},
+    )
     assert resp.status_code == 400
 
     # Case status must remain unchanged after the rejected transition.
     detail = client.get(f"/api/v1/cases/{case_id}", headers=headers).json()
     assert detail["status"] == "new"
+
+
+def test_case_close_requires_a_resolution(client, analyst_user, db):
+    """FRD-CASE-06: 'closed' with no disposition is rejected at the schema layer."""
+    alert = _make_alert(db)
+    headers = auth_headers(client, "analyst1")
+    case_id = client.post("/api/v1/alerts/promote", headers=headers, json={"alert_ids": [alert.id]}).json()["id"]
+    client.patch(f"/api/v1/cases/{case_id}/status", headers=headers, json={"status": "investigating"})
+
+    resp = client.patch(f"/api/v1/cases/{case_id}/status", headers=headers, json={"status": "closed"})
+    assert resp.status_code == 422
+    assert "resolution" in resp.text
+
+    detail = client.get(f"/api/v1/cases/{case_id}", headers=headers).json()
+    assert detail["status"] == "investigating"
+    assert detail["resolution"] is None
+
+
+def test_case_close_records_resolution_and_closed_at(client, analyst_user, db):
+    """Closing stamps the disposition and closed_at, which MTTR is computed from."""
+    alert = _make_alert(db)
+    headers = auth_headers(client, "analyst1")
+    case_id = client.post("/api/v1/alerts/promote", headers=headers, json={"alert_ids": [alert.id]}).json()["id"]
+    client.patch(f"/api/v1/cases/{case_id}/status", headers=headers, json={"status": "investigating"})
+
+    resp = client.patch(
+        f"/api/v1/cases/{case_id}/status",
+        headers=headers,
+        json={
+            "status": "closed",
+            "resolution": "true_positive",
+            "resolution_summary": "Confirmed credential stuffing; account disabled.",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "closed"
+    assert body["resolution"] == "true_positive"
+    assert body["closed_at"] is not None
+
+    # The disposition is also on the immutable timeline, not just the row.
+    status_events = [e for e in body["timeline"] if e["type"] == "status_change"]
+    assert status_events[-1]["content"]["resolution"] == "true_positive"
 
 
 def test_case_comment_and_assignment_are_recorded_on_timeline(client, analyst_user, db, admin_user):
