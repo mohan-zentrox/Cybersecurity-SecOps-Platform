@@ -6,9 +6,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  backend-lint-and-test:
-    name: Backend lint, SAST/dependency scan, and tests
+  backend:
+    name: Backend lint, SAST, and tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -29,21 +32,59 @@ jobs:
       - name: Lint (ruff)
         run: ruff check app tests
 
+      # Blocking. The current tree is clean at medium+ severity, and the two
+      # urlopen findings are marked `# nosec` with the scheme check that
+      # justifies them. A new medium finding should fail the build, not be
+      # quietly appended to a backlog nobody reads.
       - name: SAST (bandit)
-        # Non-blocking placeholder: report findings without failing the build
-        # until the team triages the initial baseline. Flip to a hard gate
-        # once the backlog of findings is addressed.
-        run: bandit -r app -ll || true
+        run: bandit -r app -ll
 
-      - name: Dependency vulnerability scan (pip-audit)
-        # Same rationale as bandit above — surfaced but non-blocking initially.
+      - name: Run tests
+        run: pytest --cov=app --cov-report=term-missing --cov-fail-under=70
+
+      - name: Verify migrations apply and reverse cleanly
+        env:
+          DATABASE_URL: sqlite:///./ci_migration_check.db
+          ENV: development
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          rm -f ci_migration_check.db
+
+      - name: Verify the seed script produces a usable install
+        env:
+          DATABASE_URL: sqlite:///./ci_seed_check.db
+          ENV: development
+          LOG_JSON: "false"
+        run: |
+          python -m app.seed --reset
+          rm -f ci_seed_check.db
+
+  dependency-scan:
+    name: Dependency vulnerability scan
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pip-audit
+        run: pip install pip-audit==2.7.3
+
+      # Non-blocking, deliberately and narrowly: several advisories against
+      # the pinned set only clear with major-version bumps (starlette 1.x,
+      # pytest 9.x) that need compatibility work first. This job reports so
+      # the backlog stays visible; it does not gate merges. Re-evaluate once
+      # those upgrades land — see docs/ARCHITECTURE.md.
+      - name: pip-audit (report only)
         run: pip-audit -r requirements.txt || true
 
-      - name: Run tests (in-memory SQLite, no external services required)
-        run: pytest --cov=app --cov-report=term-missing
-
-  frontend-build:
-    name: Frontend lint and build
+  frontend:
+    name: Frontend lint, tests, and build
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -56,21 +97,38 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: frontend/package.json
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
+      # Blocking: a lint error that cannot fail the build is a lint error
+      # nobody fixes.
       - name: Lint
-        run: npm run lint || true
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
 
       - name: Type-check and build
         run: npm run build
 
-  container-build:
-    name: Build container images
+  secret-scan:
+    name: Secret scan
     runs-on: ubuntu-latest
-    needs: [backend-lint-and-test, frontend-build]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan history for committed credentials
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  containers:
+    name: Build and scan container images
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
     steps:
       - uses: actions/checkout@v4
 
@@ -79,3 +137,66 @@ jobs:
 
       - name: Build frontend image
         run: docker build -t aegis-frontend:ci ./frontend
+
+      - name: Scan backend image (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: aegis-backend:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0" # report first; flip to "1" once the base image backlog is clear
+
+      - name: Scan frontend image (Trivy)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: aegis-frontend:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "0"
+
+  compose-smoke:
+    name: End-to-end smoke test
+    runs-on: ubuntu-latest
+    needs: [backend, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare environment file
+        run: |
+          cp .env.example .env
+          sed -i 's|^JWT_SECRET_KEY=.*|JWT_SECRET_KEY=ci-only-secret-value-at-least-32-characters|' .env
+
+      - name: Start the stack
+        run: docker compose up -d --build
+
+      # The previous frontend image shipped no nginx config, so the SPA served
+      # fine while every /api call 404'd against nginx. This asserts the path
+      # the console actually uses, end to end, through the proxy.
+      - name: Wait for the API to become ready
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/readyz > /dev/null; then exit 0; fi
+            sleep 3
+          done
+          echo "API did not become ready"; docker compose logs --tail=100; exit 1
+
+      - name: Log in through the frontend proxy with a seeded account
+        run: |
+          TOKEN=$(curl -fsS -X POST http://localhost:5173/api/v1/auth/login \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"AegisAdmin!2024"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["access_token"])')
+          test -n "$TOKEN"
+          curl -fsS http://localhost:5173/api/v1/kpis/summary -H "Authorization: Bearer $TOKEN" > /dev/null
+          curl -fsS http://localhost:5173/api/v1/alerts -H "Authorization: Bearer $TOKEN" > /dev/null
+
+      - name: Confirm the SPA history fallback serves deep links
+        run: |
+          curl -fsS http://localhost:5173/cases/1 | grep -q '<div id="root">'
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

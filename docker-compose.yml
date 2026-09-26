@@ -1,20 +1,23 @@
-version: "3.9"
-
 # Local dev stack. See docs/ARCHITECTURE.md for the "why" behind the queue
 # and event-store abstractions referenced below.
 #
-#   * `redis` here backs the Queue abstraction (app/services/queue.py) in
-#     its RedisStreamQueue implementation. A future Kafka deployment would
-#     replace this service with Kafka + Zookeeper/KRaft and implement
+#   * `redis` backs the Queue abstraction (app/services/queue.py) in its
+#     RedisStreamQueue implementation, which uses consumer groups so an
+#     ingest batch is acknowledged only after it has been durably written.
+#     A future Kafka deployment would replace this service and implement
 #     KafkaQueueAdapter against the same Queue interface — no application
 #     code outside services/queue.py would need to change.
 #   * `postgres` backs both the relational metadata tables AND, via the
 #     PostgresJSONBEventStore repository implementation, the normalized
-#     event store for local dev. A future OpenSearch/Elastic deployment
-#     would add an `opensearch` service here and an OpenSearchEventStore
-#     implementing the same EventStoreRepository interface
-#     (app/services/normalizer.py) — callers (the rule engine, the API
-#     layer) would not need to change.
+#     event store. A future OpenSearch/Elastic deployment would add an
+#     `opensearch` service here and an OpenSearchEventStore implementing the
+#     same EventStoreRepository interface (app/services/normalizer.py) —
+#     callers (the rule engine, the API layer) would not need to change.
+#   * `migrate` runs Alembic then seeds, and every other service waits for it
+#     to finish. Without that ordering the API can come up against an empty
+#     schema and nobody can log in.
+#   * `worker` drains the ingest queue out-of-band. It only does real work
+#     when INGEST_MODE=worker; with the default inline mode it idles.
 
 services:
   postgres:
@@ -43,6 +46,22 @@ services:
       timeout: 5s
       retries: 10
 
+  # One-shot: apply migrations, then seed users/rules/channels/controls.
+  # Exits 0 when done; the API and worker wait on that.
+  migrate:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://aegis:aegis@postgres:5432/aegis
+      ENV: development
+      LOG_JSON: "false"
+    command: >
+      sh -c "alembic upgrade head && python -m app.seed"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
   backend:
     build: ./backend
     env_file: .env
@@ -51,6 +70,10 @@ services:
       REDIS_URL: redis://redis:6379/0
       QUEUE_BACKEND: redis
       ENV: development
+      # "inline" processes each ingest request end to end (deterministic,
+      # good for demos). Set to "worker" to hand off to the worker service.
+      INGEST_MODE: inline
+      SCHEDULER_ENABLED: "true"
     ports:
       - "8000:8000"
     depends_on:
@@ -58,9 +81,39 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).status == 200 else 1)\""]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  worker:
+    build: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://aegis:aegis@postgres:5432/aegis
+      REDIS_URL: redis://redis:6379/0
+      QUEUE_BACKEND: redis
+      ENV: development
+      QUEUE_CONSUMER_NAME: worker-1
+      # The worker never runs the scheduler: SLA sweeps and feed polls belong
+      # to exactly one process, and that is the API container.
+      SCHEDULER_ENABLED: "false"
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      redis:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
 
   frontend:
     build: ./frontend
+    environment:
+      BACKEND_ORIGIN: http://backend:8000
     ports:
       - "5173:80"
     depends_on:

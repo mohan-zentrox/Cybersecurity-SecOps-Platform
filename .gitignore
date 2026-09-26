@@ -28,3 +28,6 @@ Thumbs.db
 
 # --- Docker ---
 *.pid
+
+# TypeScript incremental build cache
+*.tsbuildinfo
