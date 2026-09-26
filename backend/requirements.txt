@@ -5,6 +5,7 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 pydantic==2.10.3
 pydantic-settings==2.6.1
+email-validator==2.2.0
 SQLAlchemy==2.0.31
 alembic==1.13.2
 psycopg2-binary==2.9.9
@@ -12,6 +13,10 @@ redis==5.0.7
 PyJWT==2.10.1
 python-multipart==0.0.18
 bcrypt==4.1.3
+
+# Vulnerability scan ingestion parses attacker-influenced XML; defusedxml
+# disables entity expansion and external DTD fetching (see services/vuln_ingest.py).
+defusedxml==0.7.1
 
 # Testing
 pytest==8.3.4

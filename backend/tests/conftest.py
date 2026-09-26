@@ -13,6 +13,9 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 os.environ.setdefault("ENV", "test")
 os.environ.setdefault("QUEUE_BACKEND", "memory")
 os.environ.setdefault("JWT_SECRET_KEY", "test-only-secret-not-for-production")
+os.environ.setdefault("SCHEDULER_ENABLED", "false")  # no background jobs under test
+os.environ.setdefault("LOG_LEVEL", "WARNING")        # silence per-request access logs
+os.environ.setdefault("LOG_JSON", "false")
 
 import pytest
 from fastapi.testclient import TestClient
