@@ -26,8 +26,11 @@ services:
       POSTGRES_USER: aegis
       POSTGRES_PASSWORD: aegis
       POSTGRES_DB: aegis
-    ports:
-      - "5432:5432"
+    # Deliberately not published to the host. Every service that needs the
+    # database reaches it over the compose network as `postgres:5432`, and
+    # publishing 5432 collides with the local PostgreSQL that most developer
+    # machines already run. For an interactive shell use:
+    #   docker compose exec postgres psql -U aegis
     volumes:
       - aegis_postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -38,8 +41,10 @@ services:
 
   redis:
     image: redis:7-alpine
-    ports:
-      - "6379:6379"
+    # Not published either, for the same reason: services reach it as
+    # `redis:6379` on the compose network, and 6379 is commonly already
+    # bound on a developer machine. For an interactive shell use:
+    #   docker compose exec redis redis-cli
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -50,6 +55,12 @@ services:
   # Exits 0 when done; the API and worker wait on that.
   migrate:
     build: ./backend
+    # migrate, backend and worker are the same image with different commands.
+    # They must share an explicit tag: without one, compose builds the
+    # identical ./backend context concurrently for each service and the three
+    # exports race, failing with `image ... already exists` and aborting `up`.
+    # With the tag it is built once and reused.
+    image: aegis-backend:local
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg2://aegis:aegis@postgres:5432/aegis
@@ -64,6 +75,7 @@ services:
 
   backend:
     build: ./backend
+    image: aegis-backend:local  # shared with migrate/worker — see the note on `migrate`
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg2://aegis:aegis@postgres:5432/aegis
@@ -75,7 +87,9 @@ services:
       INGEST_MODE: inline
       SCHEDULER_ENABLED: "true"
     ports:
-      - "8000:8000"
+      # Defaults to 8000 so the README's documented URLs keep working. Set
+      # API_PORT in .env if something else on the host already binds it.
+      - "${API_PORT:-8000}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -92,6 +106,7 @@ services:
 
   worker:
     build: ./backend
+    image: aegis-backend:local  # shared with migrate/backend — see the note on `migrate`
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg2://aegis:aegis@postgres:5432/aegis
@@ -115,7 +130,9 @@ services:
     environment:
       BACKEND_ORIGIN: http://backend:8000
     ports:
-      - "5173:80"
+      # Defaults to 5173, the URL the README tells you to open. Set
+      # CONSOLE_PORT in .env to move it.
+      - "${CONSOLE_PORT:-5173}:80"
     depends_on:
       - backend
 
