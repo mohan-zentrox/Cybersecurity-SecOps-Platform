@@ -38,8 +38,11 @@ def _alert(db, **kwargs) -> Alert:
 
 
 def test_window_parsing():
-    assert (parse_window("24h").end - parse_window("24h").start) == timedelta(hours=24)
-    assert (parse_window("7d").end - parse_window("7d").start) == timedelta(days=7)
+    # Each call stamps its own `now`, so measure the span within a single window.
+    for spec, expected in (("24h", timedelta(hours=24)), ("7d", timedelta(days=7))):
+        window = parse_window(spec)
+        assert window.end - window.start == expected
+        assert window.label == spec
     for bad in ("", "7", "7w", "-1d", "0d", "abc"):
         with pytest.raises(ValueError):
             parse_window(bad)
