@@ -139,7 +139,7 @@ jobs:
         run: docker build -t aegis-frontend:ci ./frontend
 
       - name: Scan backend image (Trivy)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: aegis-backend:ci
           severity: CRITICAL,HIGH
@@ -147,7 +147,7 @@ jobs:
           exit-code: "0" # report first; flip to "1" once the base image backlog is clear
 
       - name: Scan frontend image (Trivy)
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: aegis-frontend:ci
           severity: CRITICAL,HIGH
