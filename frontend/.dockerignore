@@ -1,0 +1,23 @@
+# Keep the Docker build context small. Without this, `docker build ./frontend`
+# ships the entire node_modules tree to the daemon before the first layer runs,
+# which makes `docker compose up --build` take many minutes. The image installs
+# its own dependencies from package-lock.json inside the builder stage, so none
+# of this is needed in the context.
+
+node_modules
+dist
+.vite
+
+# Local env overrides must never be baked into an image.
+.env
+.env.*
+*.local
+
+# Test/build caches and editor state.
+coverage
+*.tsbuildinfo
+.eslintcache
+.DS_Store
+Thumbs.db
+.vscode
+.idea

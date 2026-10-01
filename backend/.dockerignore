@@ -1,0 +1,28 @@
+# Keep the Docker build context small and avoid baking local state into the
+# image. The Dockerfile installs dependencies from requirements.txt, so no
+# local virtualenv or cache needs to travel with the context.
+
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+
+# Caches
+.pytest_cache
+.ruff_cache
+.coverage
+htmlcov
+
+# Local databases must never end up in an image.
+*.db
+*.sqlite3
+
+# Local env overrides.
+.env
+.env.*
+
+.DS_Store
+Thumbs.db
+.vscode
+.idea
